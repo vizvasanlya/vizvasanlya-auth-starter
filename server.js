@@ -1,29 +1,52 @@
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 
 const app = express();
-const users = new Map();
-const tokens = new Map();
+const DATA_FILE = path.join(__dirname, 'data.json');
 
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
+
+function load() {
+  try {
+    return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+  } catch {
+    return { users: [] };
+  }
+}
+
+function save(data) {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+}
 
 function hashPassword(password, salt) {
-  return crypto.pbkdf2Sync(password, salt, 120000, 32, 'sha256').toString('hex');
+  return crypto.pbkdf2Sync(password, salt, 160000, 32, 'sha256').toString('hex');
 }
 
 function token() {
-  return crypto.randomBytes(24).toString('hex');
+  return crypto.randomBytes(32).toString('hex');
+}
+
+function userResponse(user) {
+  return {
+    id: user.id,
+    email: user.email,
+    name: user.name || null,
+    createdAt: user.createdAt
+  };
 }
 
 function auth(req, res, next) {
   const header = req.headers.authorization || '';
-  const tokenValue = header.replace('Bearer ', '');
-  const userId = tokens.get(tokenValue);
-  if (!userId) {
-    return res.status(401).json({ error: 'Invalid token.' });
-  }
-  req.userId = userId;
-  return next();
+  const value = header.startsWith('Bearer ') ? header.slice(7) : '';
+  const data = load();
+  const match = data.tokens.find((entry) => entry.token === value && (!entry.expiresAt || new Date(entry.expiresAt) > new Date()));
+  if (!match) return res.status(401).json({ error: 'Invalid or expired token.' });
+  const user = data.users.find((entry) => entry.id === match.userId);
+  if (!user) return res.status(401).json({ error: 'User not found.' });
+  req.user = user;
+  next();
 }
 
 app.get('/health', (req, res) => {
@@ -31,40 +54,66 @@ app.get('/health', (req, res) => {
 });
 
 app.post('/register', (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password || password.length < 8) {
-    return res.status(400).json({ error: 'Email and password with at least 8 characters are required.' });
+  const { email, password, name } = req.body || {};
+  if (!email || !password || password.length < 8 || !/^\S+@\S+\.\S+$/.test(email)) {
+    return res.status(400).json({ error: 'Provide a valid email and password with at least 8 characters.' });
   }
-  if (users.has(email)) {
+
+  const data = load();
+  if (data.users.some((user) => user.email.toLowerCase() === email.toLowerCase())) {
     return res.status(409).json({ error: 'User already exists.' });
   }
 
   const salt = crypto.randomBytes(16).toString('hex');
-  users.set(email, {
-    email,
+  const user = {
+    id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random()),
+    email: email.toLowerCase(),
+    name: name || null,
     salt,
     passwordHash: hashPassword(password, salt),
     createdAt: new Date().toISOString()
-  });
+  };
 
-  return res.status(201).json({ email, message: 'User created.' });
+  data.users.push(user);
+  save(data);
+  return res.status(201).json({ user: userResponse(user) });
 });
 
 app.post('/login', (req, res) => {
   const { email, password } = req.body || {};
-  const user = users.get(email);
+  const data = load();
+  const user = data.users.find((entry) => entry.email === String(email || '').toLowerCase());
   if (!user || user.passwordHash !== hashPassword(password, user.salt)) {
     return res.status(401).json({ error: 'Invalid credentials.' });
   }
 
   const accessToken = token();
-  tokens.set(accessToken, email);
-  return res.json({ accessToken, tokenType: 'Bearer' });
+  data.tokens.push({ token: accessToken, userId: user.id, expiresAt: new Date(Date.now() + 86400000).toISOString() });
+  data.tokens = data.tokens.filter((entry) => new Date(entry.expiresAt) > new Date());
+  save(data);
+  return res.json({ accessToken, tokenType: 'Bearer', expiresIn: 86400, user: userResponse(user) });
 });
 
 app.get('/me', auth, (req, res) => {
-  const user = users.get(req.userId);
-  return res.json({ email: user.email, createdAt: user.createdAt });
+  res.json({ user: userResponse(req.user) });
+});
+
+app.patch('/me', auth, (req, res) => {
+  const data = load();
+  const user = data.users.find((entry) => entry.id === req.user.id);
+  const name = req.body.name;
+  if (name !== undefined) user.name = String(name).slice(0, 80);
+  save(data);
+  res.json({ user: userResponse(user) });
+});
+
+app.post('/logout', auth, (req, res) => {
+  const header = req.headers.authorization || '';
+  const value = header.startsWith('Bearer ') ? header.slice(7) : '';
+  const data = load();
+  data.tokens = data.tokens.filter((entry) => entry.token !== value);
+  save(data);
+  res.json({ ok: true });
 });
 
 app.use((req, res) => {
