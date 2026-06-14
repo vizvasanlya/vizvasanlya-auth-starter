@@ -5,7 +5,9 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js"
+    "check": "node --check server.js",
+    "lint": "echo \"No linter installed\"",
+    "format": "echo \"No formatter installed\""
   },
   "dependencies": {
     "express": "^4.18.3"
